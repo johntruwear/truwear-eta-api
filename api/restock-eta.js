@@ -1,106 +1,127 @@
-   // api/restock-eta.js
-   // Vercel serverless function to return earliest restock ETA for a SKU from SOS Inventory
+/**
+ * Restock ETA API – uses SOS Inventory v2 API.
+ * GET ?sku=XXX → { "eta": "YYYY-MM-DD" } or { "eta": null }
+ *
+ * Response shape (SOS v2):
+ * - Item: itemRaw.data[] and optionally matchedItem (from item?search=sku).
+ * - POs: purchaseorder?itemId=X returns body with data[] (not purchaseOrders).
+ * - PO date: expectedDate or date.
+ */
 
-   export default async function handler(req, res) {
-     if (req.method !== 'GET') {
-       res.status(405).json({ error: 'Method not allowed' });
-       return;
-     }
+const SOS_API_BASE = process.env.SOS_API_BASE || 'https://api.sosinventory.com/api/v2';
+const SOS_AUTH_HEADER = process.env.SOS_AUTH_HEADER || '';
 
-     const { sku } = req.query;
-     if (!sku) {
-       res.status(400).json({ error: 'sku required' });
-       return;
-     }
+function getAuthHeader() {
+  const raw = (SOS_AUTH_HEADER || '').trim();
+  if (raw.toLowerCase().startsWith('bearer ')) return raw;
+  if (raw) return `Bearer ${raw}`;
+  return '';
+}
 
-     const base = process.env.SOS_API_BASE;
-     const authHeader = process.env.SOS_AUTH_HEADER;
+async function fetchSOS(path) {
+  const url = `${SOS_API_BASE.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
+  const auth = getAuthHeader();
+  if (!auth) {
+    throw new Error('SOS_AUTH_HEADER is not set');
+  }
+  const res = await fetch(url, {
+    headers: {
+      Authorization: auth,
+      Accept: 'application/json',
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`SOS API error ${res.status}: ${text}`);
+  }
+  return res.json();
+}
 
-     if (!base || !authHeader) {
-       res.status(500).json({ error: 'SOS API not configured', eta: null });
-       return;
-     }
+/**
+ * Resolve item by SKU. Uses matchedItem when present, else finds in itemRaw.data or data[] by sku.
+ */
+function getItemFromItemResponse(body, sku) {
+  const targetSku = (sku || '').trim().toUpperCase();
+  if (!targetSku) return null;
 
-     try {
-       // 1) Look up item by SKU (assumes SOS v2 uses `code` as SKU)
-       const itemRes = await fetch(
-         `${base}/item?code=${encodeURIComponent(sku)}`,
-         {
-           headers: {
-             'Authorization': authHeader,
-             'Accept': 'application/json',
-             'Host': 'api.sosinventory.com'
-           }
-         }
-       );
+  if (body.matchedItem && String((body.matchedItem.sku || '')).trim().toUpperCase() === targetSku) {
+    return body.matchedItem;
+  }
+  // Single item response (e.g. item?id=X)
+  if (body.sku && String((body.sku || '')).trim().toUpperCase() === targetSku) {
+    return body;
+  }
+  const data = body.itemRaw?.data ?? body.data;
+  if (Array.isArray(data)) {
+    const found = data.find(
+      (it) => String((it.sku || '')).trim().toUpperCase() === targetSku
+    );
+    if (found) return found;
+  }
+  return null;
+}
 
-       if (!itemRes.ok) {
-         console.error('Item lookup failed', await itemRes.text());
-         return res.status(200).json({ eta: null });
-       }
+/**
+ * Get earliest ETA from PO list. POs are in response.data (SOS v2).
+ * Uses expectedDate first, then date; ignores deleted/past as needed.
+ */
+function getEarliestEtaFromPOs(poResponse) {
+  const list = poResponse.data || poResponse.poRaw?.data || poResponse.purchaseOrders || [];
+  if (!Array.isArray(list) || list.length === 0) return null;
 
-       const itemJson = await itemRes.json();
-       const item = itemJson.items && itemJson.items[0];
-       if (!item || !item.id) {
-         return res.status(200).json({ eta: null });
-       }
+  const now = new Date();
+  let earliest = null;
 
-       // 2) Fetch open purchase orders that include this item
-       const poRes = await fetch(
-         `${base}/purchaseorder?status=Open&itemId=${encodeURIComponent(
-           item.id
-         )}`,
-         {
-           headers: {
-             'Authorization': authHeader,
-             'Accept': 'application/json',
-             'Host': 'api.sosinventory.com'
-           }
-         }
-       );
+  for (const po of list) {
+    if (po.deleted) continue;
+    const dateStr = po.expectedDate ?? po.expectedShip ?? po.date ?? po.shipDate;
+    if (!dateStr) continue;
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) continue;
+    if (d < now) continue; // optional: skip past dates
+    if (!earliest || d < earliest) earliest = d;
+  }
 
-       if (!poRes.ok) {
-         console.error('PO lookup failed', await poRes.text());
-         return res.status(200).json({ eta: null });
-       }
+  if (!earliest) return null;
+  return earliest.toISOString().slice(0, 10); // YYYY-MM-DD
+}
 
-       const poJson = await poRes.json();
-       const purchaseOrders = poJson.purchaseOrders || [];
-       if (!purchaseOrders.length) {
-         return res.status(200).json({ eta: null });
-       }
+module.exports = async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-       // 3) Find earliest expectedDate where qty outstanding > 0
-       const etas = [];
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
 
-       for (const po of purchaseOrders) {
-         const lines = po.lines || [];
-         const line = lines.find((l) => l.item && l.item.id === item.id);
-         if (!line) continue;
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed', eta: null });
+  }
 
-         const ordered = line.quantity || 0;
-         const received = line.quantityReceived || 0;
-         const outstanding = ordered - received;
+  const sku = (req.query.sku || '').trim();
+  if (!sku) {
+    return res.status(400).json({ error: 'Missing sku', eta: null });
+  }
 
-         if (outstanding <= 0) continue;
-         if (!po.expectedDate) continue;
+  try {
+    // 1) Item by SKU – SOS v2 returns matchedItem + itemRaw.data
+    const itemRes = await fetchSOS(`item?search=${encodeURIComponent(sku)}`);
+    const item = getItemFromItemResponse(itemRes, sku);
+    if (!item || !item.id) {
+      return res.status(200).json({ eta: null });
+    }
 
-         const d = new Date(po.expectedDate);
-         if (!Number.isNaN(d.getTime())) {
-           etas.push(d);
-         }
-       }
+    // 2) POs for this item – SOS v2 returns data[] (not purchaseOrders)
+    const poRes = await fetchSOS(`purchaseorder?itemId=${item.id}`);
+    const eta = getEarliestEtaFromPOs(poRes);
 
-       if (!etas.length) {
-         return res.status(200).json({ eta: null });
-       }
-
-       etas.sort((a, b) => a - b);
-       const earliest = etas[0].toISOString();
-
-       return res.status(200).json({ eta: earliest });
-     } catch (err) {
-       console.error('Error in /api/restock-eta', err);
-       return res.status(500).json({ eta: null, error: 'internal_error' });
-     }
-   }
+    return res.status(200).json({ eta });
+  } catch (err) {
+    console.error('restock-eta error:', err.message);
+    return res.status(500).json({
+      error: err.message || 'Server error',
+      eta: null,
+    });
+  }
+}
