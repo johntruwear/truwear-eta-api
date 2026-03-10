@@ -105,9 +105,31 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    // 1) Item by SKU – SOS v2 returns matchedItem + itemRaw.data
-    const itemRes = await fetchSOS(`item?search=${encodeURIComponent(sku)}`);
-    const item = getItemFromItemResponse(itemRes, sku);
+    // 1) Item by SKU – try exact sku= first, then search with pagination (item may not be in first 200)
+    let item = null;
+    try {
+      const exactRes = await fetchSOS(`item?sku=${encodeURIComponent(sku)}`);
+      item = getItemFromItemResponse(exactRes, sku);
+    } catch (_) {
+      // item?sku= may 404 or not exist; fall back to search
+    }
+    if (!item) {
+      let start = 0;
+      const pageSize = 200;
+      const maxPages = 70; // ~14k items
+      for (let p = 0; p < maxPages; p++) {
+        const searchRes = await fetchSOS(
+          `item?search=${encodeURIComponent(sku)}&start=${start}&maxresults=${pageSize}`
+        );
+        item = getItemFromItemResponse(searchRes, sku);
+        if (item) break;
+        const raw = searchRes.itemRaw || searchRes;
+        const count = raw.count ?? raw.data?.length ?? 0;
+        const totalCount = raw.totalCount ?? 0;
+        if (count === 0 || (totalCount > 0 && start + count >= totalCount)) break;
+        start += pageSize;
+      }
+    }
     if (!item || !item.id) {
       return res.status(200).json({ eta: null });
     }
