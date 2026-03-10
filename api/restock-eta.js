@@ -118,37 +118,35 @@ function getEarliestEtaFromPOs(poListOrResponse, options = {}) {
 
 /**
  * Get ETA for a single SKU. Returns { eta, debug? }. Used by single and batch endpoints.
+ * Item lookup: run exact + first search page in parallel to minimize round-trips; cap fallback pages.
  */
 async function getEtaForSku(sku, options = {}) {
   const debug = options.debug === true;
   const skuTrim = (sku || '').trim();
   if (!skuTrim) return { eta: null };
 
-  // 1) Item by SKU – try exact sku= first, then search with pagination (item may not be in first 200)
+  const encodedSku = encodeURIComponent(skuTrim);
+  const pageSize = 500;
+  const maxFallbackPages = 2; // only 2 extra search pages for speed (500 + 500 + 500 = 1500 items max)
+
+  // 1) Item by SKU – run exact and first search page in parallel (2 round-trips in parallel, not sequential)
   let item = null;
-  try {
-    const exactRes = await fetchSOS(`item?sku=${encodeURIComponent(skuTrim)}`);
-    item = getItemFromItemResponse(exactRes, skuTrim);
-  } catch (_) {
-    // item?sku= may 404 or not exist; fall back to search
+  const [exactRes, firstSearchRes] = await Promise.all([
+    fetchSOS(`item?sku=${encodedSku}`).catch(() => null),
+    fetchSOS(`item?search=${encodedSku}&start=0&maxresults=${pageSize}`).catch(() => null),
+  ]);
+  if (exactRes) item = getItemFromItemResponse(exactRes, skuTrim);
+  if (!item && firstSearchRes) item = getItemFromItemResponse(firstSearchRes, skuTrim);
+
+  // 2) If still not found, try at most maxFallbackPages more search pages (sequential but capped)
+  for (let p = 1; p <= maxFallbackPages && !item; p++) {
+    const start = p * pageSize;
+    const searchRes = await fetchSOS(
+      `item?search=${encodedSku}&start=${start}&maxresults=${pageSize}`
+    );
+    item = getItemFromItemResponse(searchRes, skuTrim);
   }
-  if (!item) {
-    let start = 0;
-    const pageSize = 200;
-    const maxPages = 70; // ~14k items
-    for (let p = 0; p < maxPages; p++) {
-      const searchRes = await fetchSOS(
-        `item?search=${encodeURIComponent(skuTrim)}&start=${start}&maxresults=${pageSize}`
-      );
-      item = getItemFromItemResponse(searchRes, skuTrim);
-      if (item) break;
-      const raw = searchRes.itemRaw || searchRes;
-      const count = raw.count ?? raw.data?.length ?? 0;
-      const totalCount = raw.totalCount ?? 0;
-      if (count === 0 || (totalCount > 0 && start + count >= totalCount)) break;
-      start += pageSize;
-    }
-  }
+
   if (!item || !item.id) {
     const out = { eta: null };
     if (debug) out.debug = { resolvedItem: null, message: 'No item found for this SKU' };
