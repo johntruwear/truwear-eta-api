@@ -11,6 +11,10 @@
 const SOS_API_BASE = process.env.SOS_API_BASE || 'https://api.sosinventory.com/api/v2';
 const SOS_AUTH_HEADER = process.env.SOS_AUTH_HEADER || '';
 
+/** In-memory cache: SKU -> { eta, cachedAt }. TTL from env (default 10 min). Set RESTOCK_ETA_CACHE_TTL_MS=0 to disable. */
+const CACHE_TTL_MS = Math.max(0, parseInt(process.env.RESTOCK_ETA_CACHE_TTL_MS, 10) || 10 * 60 * 1000);
+const etaCache = new Map();
+
 function getAuthHeader() {
   const raw = (SOS_AUTH_HEADER || '').trim();
   if (raw.toLowerCase().startsWith('bearer ')) return raw;
@@ -134,6 +138,15 @@ async function getEtaForSku(sku, options = {}) {
   const skuTrim = (sku || '').trim();
   if (!skuTrim) return { eta: null };
 
+  const cacheKey = skuTrim.toUpperCase();
+  if (CACHE_TTL_MS > 0) {
+    const cached = etaCache.get(cacheKey);
+    if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
+      if (debug) return { eta: cached.eta, debug: { cacheHit: true } };
+      return { eta: cached.eta };
+    }
+  }
+
   const encodedSku = encodeURIComponent(skuTrim);
   const pageSize = 500;
   const maxFallbackPages = 2; // only 2 extra search pages for speed (500 + 500 + 500 = 1500 items max)
@@ -170,6 +183,7 @@ async function getEtaForSku(sku, options = {}) {
     console.log(`[SOS timing] sku=${skuTrim} total=${timing.totalMs}ms`, JSON.stringify(timing));
     const out = { eta: null };
     if (debug) out.debug = { resolvedItem: null, message: 'No item found for this SKU', timing };
+    if (CACHE_TTL_MS > 0) etaCache.set(cacheKey, { eta: null, cachedAt: Date.now() });
     return out;
   }
 
@@ -199,6 +213,10 @@ async function getEtaForSku(sku, options = {}) {
       poDates: typeof result === 'object' ? result.debugDates : undefined,
       timing,
     };
+  }
+
+  if (CACHE_TTL_MS > 0) {
+    etaCache.set(cacheKey, { eta, cachedAt: Date.now() });
   }
   return out;
 }
