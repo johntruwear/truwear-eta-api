@@ -116,7 +116,70 @@ function getEarliestEtaFromPOs(poListOrResponse, options = {}) {
   return eta;
 }
 
-module.exports = async function handler(req, res) {
+/**
+ * Get ETA for a single SKU. Returns { eta, debug? }. Used by single and batch endpoints.
+ */
+async function getEtaForSku(sku, options = {}) {
+  const debug = options.debug === true;
+  const skuTrim = (sku || '').trim();
+  if (!skuTrim) return { eta: null };
+
+  // 1) Item by SKU – try exact sku= first, then search with pagination (item may not be in first 200)
+  let item = null;
+  try {
+    const exactRes = await fetchSOS(`item?sku=${encodeURIComponent(skuTrim)}`);
+    item = getItemFromItemResponse(exactRes, skuTrim);
+  } catch (_) {
+    // item?sku= may 404 or not exist; fall back to search
+  }
+  if (!item) {
+    let start = 0;
+    const pageSize = 200;
+    const maxPages = 70; // ~14k items
+    for (let p = 0; p < maxPages; p++) {
+      const searchRes = await fetchSOS(
+        `item?search=${encodeURIComponent(skuTrim)}&start=${start}&maxresults=${pageSize}`
+      );
+      item = getItemFromItemResponse(searchRes, skuTrim);
+      if (item) break;
+      const raw = searchRes.itemRaw || searchRes;
+      const count = raw.count ?? raw.data?.length ?? 0;
+      const totalCount = raw.totalCount ?? 0;
+      if (count === 0 || (totalCount > 0 && start + count >= totalCount)) break;
+      start += pageSize;
+    }
+  }
+  if (!item || !item.id) {
+    const out = { eta: null };
+    if (debug) out.debug = { resolvedItem: null, message: 'No item found for this SKU' };
+    return out;
+  }
+
+  // 2) POs for this item – filter by line item so we only use POs that actually contain this SKU
+  const poRes = await fetchSOS(`purchaseorder?itemId=${item.id}`);
+  const rawList = poRes.data || poRes.poRaw?.data || poRes.purchaseOrders || [];
+  const posForItem = filterPOsByItemId(poRes, item.id);
+  const listToUse = posForItem.length > 0 ? posForItem : rawList;
+  const result = getEarliestEtaFromPOs(listToUse, { debug });
+
+  const eta = typeof result === 'object' ? result.eta : result;
+  const out = { eta };
+  if (debug) {
+    out.debug = {
+      requestedSku: skuTrim,
+      resolvedItemId: item.id,
+      resolvedItemSku: item.sku || null,
+      resolvedItemName: item.name || null,
+      rawPoCount: rawList.length,
+      posWithItemOnLine: posForItem.length,
+      poCountUsed: typeof result === 'object' ? result.poCount : undefined,
+      poDates: typeof result === 'object' ? result.debugDates : undefined,
+    };
+  }
+  return out;
+}
+
+async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -136,60 +199,7 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    // 1) Item by SKU – try exact sku= first, then search with pagination (item may not be in first 200)
-    let item = null;
-    try {
-      const exactRes = await fetchSOS(`item?sku=${encodeURIComponent(sku)}`);
-      item = getItemFromItemResponse(exactRes, sku);
-    } catch (_) {
-      // item?sku= may 404 or not exist; fall back to search
-    }
-    if (!item) {
-      let start = 0;
-      const pageSize = 200;
-      const maxPages = 70; // ~14k items
-      for (let p = 0; p < maxPages; p++) {
-        const searchRes = await fetchSOS(
-          `item?search=${encodeURIComponent(sku)}&start=${start}&maxresults=${pageSize}`
-        );
-        item = getItemFromItemResponse(searchRes, sku);
-        if (item) break;
-        const raw = searchRes.itemRaw || searchRes;
-        const count = raw.count ?? raw.data?.length ?? 0;
-        const totalCount = raw.totalCount ?? 0;
-        if (count === 0 || (totalCount > 0 && start + count >= totalCount)) break;
-        start += pageSize;
-      }
-    }
-    if (!item || !item.id) {
-      const out = { eta: null };
-      if (debug) out.debug = { resolvedItem: null, message: 'No item found for this SKU' };
-      return res.status(200).json(out);
-    }
-
-    // 2) POs for this item – filter by line item so we only use POs that actually contain this SKU
-    const poRes = await fetchSOS(`purchaseorder?itemId=${item.id}`);
-    const rawList = poRes.data || poRes.poRaw?.data || poRes.purchaseOrders || [];
-    const posForItem = filterPOsByItemId(poRes, item.id);
-    // If no POs have lines (or none match), API may have already filtered by itemId – use raw list
-    const listToUse = posForItem.length > 0 ? posForItem : rawList;
-    const result = getEarliestEtaFromPOs(listToUse, { debug });
-
-    const eta = typeof result === 'object' ? result.eta : result;
-    const out = { eta };
-    if (debug) {
-      out.debug = {
-        requestedSku: sku,
-        resolvedItemId: item.id,
-        resolvedItemSku: item.sku || null,
-        resolvedItemName: item.name || null,
-        rawPoCount: rawList.length,
-        posWithItemOnLine: posForItem.length,
-        poCountUsed: typeof result === 'object' ? result.poCount : undefined,
-        poDates: typeof result === 'object' ? result.debugDates : undefined,
-      };
-    }
-
+    const out = await getEtaForSku(sku, { debug });
     return res.status(200).json(out);
   } catch (err) {
     console.error('restock-eta error:', err.message);
@@ -199,3 +209,6 @@ module.exports = async function handler(req, res) {
     });
   }
 }
+
+module.exports = handler;
+module.exports.getEtaForSku = getEtaForSku;
