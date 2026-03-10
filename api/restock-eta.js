@@ -37,6 +37,15 @@ async function fetchSOS(path) {
   return res.json();
 }
 
+/** Time an async fn and return { result, ms }. Logs to console for Vercel. */
+async function timed(label, fn) {
+  const start = Date.now();
+  const result = await fn();
+  const ms = Date.now() - start;
+  console.log(`[SOS timing] ${label}: ${ms}ms`);
+  return { result, ms };
+}
+
 /**
  * Resolve item by SKU. Uses matchedItem when present, else finds in itemRaw.data or data[] by sku.
  */
@@ -128,33 +137,49 @@ async function getEtaForSku(sku, options = {}) {
   const encodedSku = encodeURIComponent(skuTrim);
   const pageSize = 500;
   const maxFallbackPages = 2; // only 2 extra search pages for speed (500 + 500 + 500 = 1500 items max)
+  const timing = { itemParallelMs: 0, itemFallbackMs: 0, purchaseOrderMs: 0, totalMs: 0 };
+  const totalStart = Date.now();
 
   // 1) Item by SKU – run exact and first search page in parallel (2 round-trips in parallel, not sequential)
   let item = null;
-  const [exactRes, firstSearchRes] = await Promise.all([
-    fetchSOS(`item?sku=${encodedSku}`).catch(() => null),
-    fetchSOS(`item?search=${encodedSku}&start=0&maxresults=${pageSize}`).catch(() => null),
-  ]);
+  const { result: parallelResults, ms: itemParallelMs } = await timed('item_lookup_parallel', () =>
+    Promise.all([
+      fetchSOS(`item?sku=${encodedSku}`).catch(() => null),
+      fetchSOS(`item?search=${encodedSku}&start=0&maxresults=${pageSize}`).catch(() => null),
+    ])
+  );
+  timing.itemParallelMs = itemParallelMs;
+  const [exactRes, firstSearchRes] = parallelResults;
   if (exactRes) item = getItemFromItemResponse(exactRes, skuTrim);
   if (!item && firstSearchRes) item = getItemFromItemResponse(firstSearchRes, skuTrim);
 
   // 2) If still not found, try at most maxFallbackPages more search pages (sequential but capped)
+  let itemFallbackMs = 0;
   for (let p = 1; p <= maxFallbackPages && !item; p++) {
     const start = p * pageSize;
-    const searchRes = await fetchSOS(
-      `item?search=${encodedSku}&start=${start}&maxresults=${pageSize}`
+    const { result: searchRes, ms } = await timed(`item_search_page_${p}`, () =>
+      fetchSOS(`item?search=${encodedSku}&start=${start}&maxresults=${pageSize}`)
     );
+    itemFallbackMs += ms;
     item = getItemFromItemResponse(searchRes, skuTrim);
   }
+  timing.itemFallbackMs = itemFallbackMs;
 
   if (!item || !item.id) {
+    timing.totalMs = Date.now() - totalStart;
+    console.log(`[SOS timing] sku=${skuTrim} total=${timing.totalMs}ms`, JSON.stringify(timing));
     const out = { eta: null };
-    if (debug) out.debug = { resolvedItem: null, message: 'No item found for this SKU' };
+    if (debug) out.debug = { resolvedItem: null, message: 'No item found for this SKU', timing };
     return out;
   }
 
-  // 2) POs for this item – filter by line item so we only use POs that actually contain this SKU
-  const poRes = await fetchSOS(`purchaseorder?itemId=${item.id}`);
+  // 3) POs for this item – filter by line item so we only use POs that actually contain this SKU
+  const { result: poRes, ms: purchaseOrderMs } = await timed('purchaseorder', () =>
+    fetchSOS(`purchaseorder?itemId=${item.id}`)
+  );
+  timing.purchaseOrderMs = purchaseOrderMs;
+  timing.totalMs = Date.now() - totalStart;
+  console.log(`[SOS timing] sku=${skuTrim} total=${timing.totalMs}ms`, JSON.stringify(timing));
   const rawList = poRes.data || poRes.poRaw?.data || poRes.purchaseOrders || [];
   const posForItem = filterPOsByItemId(poRes, item.id);
   const listToUse = posForItem.length > 0 ? posForItem : rawList;
@@ -172,6 +197,7 @@ async function getEtaForSku(sku, options = {}) {
       posWithItemOnLine: posForItem.length,
       poCountUsed: typeof result === 'object' ? result.poCount : undefined,
       poDates: typeof result === 'object' ? result.debugDates : undefined,
+      timing,
     };
   }
   return out;
